@@ -1,7 +1,6 @@
 #include <SoftwareSerial.h>
 
 // RX, TX
-// 아두이노 꼽을 땐 거꾸로 RX=3, TX=2 
 SoftwareSerial BTSerial(9,8);
 int ENpin = 7;
 const int X = A0, Y = A1;
