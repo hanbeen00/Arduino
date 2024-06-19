@@ -1,6 +1,6 @@
 Self-Balancing Robot
 ----------------------
-
+YouTube: https://youtu.be/-LzHEcrJiAs
 - 단일 PID 제어 사용
 - I2C 통신을 통한 MPU6050 데이터값 수신
 - 블루투스를 이용한 무선 시리얼 통신
