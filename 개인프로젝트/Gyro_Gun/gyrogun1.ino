@@ -1,15 +1,7 @@
-/* Code to control the mouse pointer
- * through the movement of the head
- * Change values at vx and vy (+300 and -100 in my case)
- * using the TEST code to make your project work.
- * 
- * Gabry295
- */
 #include <Mouse.h>
 #include <Wire.h>
 #include <I2Cdev.h>
 #include <MPU6050.h>
-#include <Mouse.h>
 #include "Keyboard.h"
 
 #define Relaypin 6
@@ -78,8 +70,8 @@ void loop() {
     }
   }
 
-  vx = (gx+550)/200;  // "+300" because the x axis of gyroscope give values about -350 while it's not moving. Change this value if you get something different using the TEST code, chacking if there are values far from zero.
-  vy = -(gz+200)/200; // same here about "-100"sww
+  vx = (gx+550)/200;  
+  vy = -(gz+200)/200;
   Serial.println(vy);
   if(digitalRead(5)==1){
     Mouse.move(vy, vx);
@@ -103,7 +95,7 @@ void joystickMove(int X, int Y)
   static bool isSpressed = false;
   static bool isDpressed = false;
 
-  if (Y biggerY YLimitExtremeW) // W pressed
+  if (Y biggerY YLimitExtremeW) 
   {
     if (!isWpressed)
     {
@@ -126,7 +118,7 @@ void joystickMove(int X, int Y)
     isWpressed = false;
   }
 
-  if (X smallerX XLimitExtremeA) // A pressed
+  if (X smallerX XLimitExtremeA)
   {
     if (!isApressed)
     {
@@ -149,7 +141,7 @@ void joystickMove(int X, int Y)
     isApressed = false;
   }
   
-  if (Y smallerY YLimitExtremeS) // S pressed
+  if (Y smallerY YLimitExtremeS)
   {
     if (!isSpressed)
     {
@@ -172,7 +164,7 @@ void joystickMove(int X, int Y)
     isSpressed = false;
   }
  
-  if (X biggerX XLimitExtremeD) // D pressed
+  if (X biggerX XLimitExtremeD) 
   {
     if (!isDpressed)
     {
