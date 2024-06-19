@@ -1,6 +1,6 @@
 체감형 FPS 게임 컨트롤러
 ----
-- YouTube: https://youtu.be/Q0sL2dQhdjs
+YouTube: https://youtu.be/Q0sL2dQhdjs
 
 - MPU6050를 이용한 마우스 움직임 제어
   - I2C 통신을 통한 MPU6050 자이로 데이터값 수신
