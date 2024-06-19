@@ -169,7 +169,6 @@ void loop(){
   }
 
 
-  
 
   //Control calculations
   pid_output_left = pid_output;                                             
@@ -197,25 +196,22 @@ void loop(){
     //Serial.println(s);
   }   
 
-
-  if((!(received_byte & B00001100))){                                         //Slowly reduce the setpoint to zero if no foreward or backward command is given
-    if(pid_setpoint > 0.5)pid_setpoint -=0.05;                              //If the PID setpoint is larger then 0.5 reduce the setpoint with 0.05 every loop
-    else if(pid_setpoint < -0.5)pid_setpoint +=0.05;                        //If the PID setpoint is smaller then -0.5 increase the setpoint with 0.05 every loop
-    else pid_setpoint = 0;                                                  //If the PID setpoint is smaller then 0.5 or larger then -0.5 set the setpoint to 0
+  if((!(received_byte & B00001100))){                                    
+    if(pid_setpoint > 0.5)pid_setpoint -=0.05;                         
+    else if(pid_setpoint < -0.5)pid_setpoint +=0.05;                       
+    else pid_setpoint = 0;                                                 
   }
   
-  //The self balancing point is adjusted when there is not forward or backwards movement from the transmitter. This way the robot will always find it's balancing point
-  if(pid_setpoint == 0){                                                    //If the setpoint is zero degrees
-    if(pid_output < 0)self_balance_pid_setpoint += 0.0015;                  //Increase the self_balance_pid_setpoint if the robot is still moving forewards
-    if(pid_output > 0)self_balance_pid_setpoint -= 0.0015;                  //Decrease the self_balance_pid_setpoint if the robot is still moving backwards
+  if(pid_setpoint == 0){                                                    
+    if(pid_output < 0)self_balance_pid_setpoint += 0.0015;                 
+    if(pid_output > 0)self_balance_pid_setpoint -= 0.0015;             
   }
 
 
   
-  ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
   //Motor pulse calculations
-  ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-  //To compensate for the non-linear behaviour of the stepper motors the folowing calculations are needed to get a linear speed behaviour.
+  //To compensate for the linear speed behaviour.
+  
   if(pid_output_left > 0)pid_output_left = 405 - (1/(pid_output_left + 9)) * 5500;
   else if(pid_output_left < 0)pid_output_left = -405 - (1/(pid_output_left - 9)) * 5500;
 
@@ -235,11 +231,8 @@ void loop(){
   throttle_left_motor = left_motor;
   throttle_right_motor = right_motor;
 
-  ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+  
   //Loop time timer
-  ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-  //The angle calculations are tuned for a loop time of 4 milliseconds. To make sure every loop is exactly 4 milliseconds a wait loop
-  //is created by setting the loop_timer variable to +4000 microseconds every loop.
   while(loop_timer > micros());
   loop_timer += 4000;
 }
