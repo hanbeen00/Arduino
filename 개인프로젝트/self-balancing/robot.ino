@@ -4,7 +4,7 @@ SoftwareSerial serial_SW_wireless_module(8, 9);
 
 
 int gyro_address = 0x68;                                     //MPU-6050 I2C address (0x68 or 0x69)
-int acc_calibration_value = -300;                            //Enter the accelerometer calibration value
+int acc_calibration_value = -75;                            //Enter the accelerometer calibration value
 
 //Various settings
 float pid_p_gain = 9;                                      
@@ -141,7 +141,7 @@ void loop(){
   gyro_yaw_data_raw -= gyro_yaw_calibration_value;                         //Add the gyro calibration value
   angle_gyro -= gyro_yaw_data_raw * 0.0000003;                            //Compensate the gyro offset when the robot is rotating
 
-  angle_gyro = angle_gyro * 0.9996 + angle_acc * 0.0004;                    //Correct the drift of the gyro angle with the accelerometer angle
+  angle_gyro = angle_gyro * 0.9995 + angle_acc * 0.0005;                    //Correct the drift of the gyro angle with the accelerometer angle
 
 
   //PID controller calculations
