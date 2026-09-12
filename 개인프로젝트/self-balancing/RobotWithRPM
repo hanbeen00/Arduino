@@ -1,0 +1,1085 @@
+#include <Wire.h>
+#include <SoftwareSerial.h>
+
+SoftwareSerial serial_SW_wireless_module(8, 9);
+
+
+// =====================================================
+// MPU6050
+// =====================================================
+
+int gyro_address = 0x68;
+
+int acc_calibration_value = -75;
+
+
+// =====================================================
+// PID Settings
+//
+// 이제 pid_output의 의미:
+//        목표 RPM
+// =====================================================
+
+float pid_p_gain = 20.0;
+float pid_i_gain = 0.0;
+float pid_d_gain = 0.0;
+
+float turning_speed = 30;
+float max_target_speed = 150;
+
+
+// =====================================================
+// Motor Settings
+// =====================================================
+
+// 최대 바퀴 RPM
+const float MAX_RPM = 400.0;
+
+// 작은 RPM 명령 제거
+const float RPM_DEADBAND = 5.0;
+
+
+// 1.8도 Stepper
+// 360 / 1.8 = 200 full step
+
+const int FULL_STEP_PER_REV = 200;
+
+
+// 1/4 Microstep
+const int MICROSTEP = 4;
+
+
+// 200 × 4 = 800 pulse / revolution
+const int STEP_PER_REV =
+    FULL_STEP_PER_REV * MICROSTEP;
+
+
+// Timer2 ISR = 20us
+//
+// 1 / 20us = 50,000Hz
+
+const float TIMER_ISR_FREQ = 50000.0;
+
+
+// =====================================================
+// Global Variables
+// =====================================================
+
+byte start;
+byte received_byte;
+byte low_bat;
+
+
+int left_motor;
+int throttle_left_motor;
+int throttle_counter_left_motor;
+int throttle_left_motor_memory;
+
+
+int right_motor;
+int throttle_right_motor;
+int throttle_counter_right_motor;
+int throttle_right_motor_memory;
+
+
+int battery_voltage;
+int receive_counter;
+
+
+int gyro_pitch_data_raw;
+int gyro_yaw_data_raw;
+int accelerometer_data_raw;
+
+
+long gyro_yaw_calibration_value;
+long gyro_pitch_calibration_value;
+
+
+unsigned long loop_timer;
+
+
+float angle_gyro;
+float angle_acc;
+float angle;
+
+float self_balance_pid_setpoint;
+
+
+float pid_error_temp;
+float pid_i_mem;
+float pid_setpoint;
+
+float gyro_input;
+
+float pid_output;
+float pid_last_d_error;
+
+
+float pid_output_left;
+float pid_output_right;
+
+
+// =====================================================
+// RPM → Motor TimerCount
+//
+// 1회전 = 800 pulse
+//
+// STEP 주파수:
+//
+// f_step = RPM / 60 × 800
+//
+// Timer ISR:
+//
+// 50,000 Hz
+//
+// 필요한 ISR 횟수:
+//
+// TimerCount
+// = 50000 / f_step
+//
+// = 50000 / (RPM / 60 × 800)
+//
+// = 3750 / RPM
+//
+// 현재 ISR에서
+//
+// counter > memory
+//
+// 일 때 counter가 reset되므로
+//
+// 실제 주기 = memory + 1
+//
+// 따라서 마지막에 -1
+// =====================================================
+
+int rpmToMotorTimer(float rpm)
+{
+    // ==============================================
+    // Deadband
+    // ==============================================
+
+    if(rpm < RPM_DEADBAND &&
+       rpm > -RPM_DEADBAND)
+    {
+        return 0;
+    }
+
+
+    // ==============================================
+    // 최대 RPM 제한
+    // ==============================================
+
+    if(rpm > MAX_RPM)
+    {
+        rpm = MAX_RPM;
+    }
+
+    else if(rpm < -MAX_RPM)
+    {
+        rpm = -MAX_RPM;
+    }
+
+
+    // ==============================================
+    // 방향 저장
+    // ==============================================
+
+    bool reverse = false;
+
+    if(rpm < 0)
+    {
+        reverse = true;
+        rpm *= -1;
+    }
+
+
+    // ==============================================
+    // RPM → STEP Frequency
+    // ==============================================
+
+    float step_frequency =
+        (rpm / 60.0)
+        * STEP_PER_REV;
+
+
+    // ==============================================
+    // STEP Frequency → ISR Count
+    // ==============================================
+
+    float timer_count_float =
+        TIMER_ISR_FREQ /
+        step_frequency;
+
+
+    int timer_count =
+        (int)round(timer_count_float);
+
+
+    // 현재 ISR 구조가
+    //
+    // counter > memory
+    //
+    // 이므로 실제 주기 = memory + 1
+    //
+    timer_count -= 1;
+
+
+    // STEP HIGH / LOW를 위한 최소 공간
+    if(timer_count < 2)
+    {
+        timer_count = 2;
+    }
+
+
+    // 방향은 부호로 전달
+    if(reverse)
+    {
+        timer_count *= -1;
+    }
+
+
+    return timer_count;
+}
+
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+    serial_SW_wireless_module.begin(38400);
+
+    Serial.begin(19200);
+
+
+    Wire.begin();
+
+    TWBR = 12;
+
+
+    // =================================================
+    // Timer2
+    //
+    // ISR every 20us
+    // =================================================
+
+    TCCR2A = 0;
+    TCCR2B = 0;
+
+
+    TIMSK2 |= (1 << OCIE2A);
+
+
+    // Prescaler = 8
+    TCCR2B |= (1 << CS21);
+
+
+    // 16MHz / 8
+    //
+    // OCR2A = 39
+    //
+    // → 20us
+    OCR2A = 39;
+
+
+    // CTC mode
+    TCCR2A |= (1 << WGM21);
+
+
+    // =================================================
+    // MPU6050 Wake-up
+    // =================================================
+
+    Wire.beginTransmission(gyro_address);
+
+    Wire.write(0x6B);
+
+    Wire.write(0x00);
+
+    Wire.endTransmission();
+
+
+    // =================================================
+    // Gyro ±250 degrees/sec
+    // =================================================
+
+    Wire.beginTransmission(gyro_address);
+
+    Wire.write(0x1B);
+
+    Wire.write(0x00);
+
+    Wire.endTransmission();
+
+
+    // =================================================
+    // Accelerometer ±4g
+    // =================================================
+
+    Wire.beginTransmission(gyro_address);
+
+    Wire.write(0x1C);
+
+    Wire.write(0x08);
+
+    Wire.endTransmission();
+
+
+    // =================================================
+    // Digital Low Pass Filter ≈ 43Hz
+    // =================================================
+
+    Wire.beginTransmission(gyro_address);
+
+    Wire.write(0x1A);
+
+    Wire.write(0x03);
+
+    Wire.endTransmission();
+
+
+    // =================================================
+    // Motor Pins
+    // =================================================
+
+    pinMode(2, OUTPUT);
+    pinMode(3, OUTPUT);
+
+    pinMode(4, OUTPUT);
+    pinMode(5, OUTPUT);
+
+    pinMode(13, OUTPUT);
+
+
+    // =================================================
+    // Gyro Calibration
+    // =================================================
+
+    for(
+        receive_counter = 0;
+        receive_counter < 500;
+        receive_counter++
+    )
+    {
+        if(receive_counter % 15 == 0)
+        {
+            digitalWrite(
+                13,
+                !digitalRead(13)
+            );
+        }
+
+
+        Wire.beginTransmission(
+            gyro_address
+        );
+
+
+        Wire.write(0x43);
+
+        Wire.endTransmission();
+
+
+        Wire.requestFrom(
+            gyro_address,
+            4
+        );
+
+
+        gyro_yaw_calibration_value +=
+            Wire.read() << 8 |
+            Wire.read();
+
+
+        gyro_pitch_calibration_value +=
+            Wire.read() << 8 |
+            Wire.read();
+
+
+        delayMicroseconds(3700);
+    }
+
+
+    gyro_pitch_calibration_value /=
+        500;
+
+
+    gyro_yaw_calibration_value /=
+        500;
+
+
+    // 4ms control loop
+    loop_timer =
+        micros() + 4000;
+}
+
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop()
+{
+    char s;
+
+
+    // =================================================
+    // Wireless Controller
+    // =================================================
+
+    if(
+        serial_SW_wireless_module.available()
+    )
+    {
+        received_byte =
+            serial_SW_wireless_module.read();
+
+        receive_counter = 0;
+    }
+
+
+    if(receive_counter <= 25)
+    {
+        receive_counter++;
+    }
+
+    else
+    {
+        received_byte = 0x00;
+    }
+
+
+    // =================================================
+    // Accelerometer
+    // =================================================
+
+    Wire.beginTransmission(
+        gyro_address
+    );
+
+
+    Wire.write(0x3F);
+
+    Wire.endTransmission();
+
+
+    Wire.requestFrom(
+        gyro_address,
+        2
+    );
+
+
+    accelerometer_data_raw =
+        Wire.read() << 8 |
+        Wire.read();
+
+
+    accelerometer_data_raw +=
+        acc_calibration_value;
+
+
+    if(accelerometer_data_raw > 8200)
+    {
+        accelerometer_data_raw =
+            8200;
+    }
+
+
+    if(accelerometer_data_raw < -8200)
+    {
+        accelerometer_data_raw =
+            -8200;
+    }
+
+
+    // =================================================
+    // Accelerometer Angle
+    // =================================================
+
+    angle_acc =
+        asin(
+            (float)
+            accelerometer_data_raw /
+            8200.0
+        )
+        * 57.296;
+
+
+    // =================================================
+    // Start PID near 0 degrees
+    // =================================================
+
+    if(
+        start == 0 &&
+        angle_acc > -0.25 &&
+        angle_acc < 0.25
+    )
+    {
+        angle_gyro =
+            angle_acc;
+
+        start = 1;
+    }
+
+
+    // =================================================
+    // Gyroscope
+    // =================================================
+
+    Wire.beginTransmission(
+        gyro_address
+    );
+
+
+    Wire.write(0x43);
+
+    Wire.endTransmission();
+
+
+    Wire.requestFrom(
+        gyro_address,
+        4
+    );
+
+
+    gyro_yaw_data_raw =
+        Wire.read() << 8 |
+        Wire.read();
+
+
+    gyro_pitch_data_raw =
+        Wire.read() << 8 |
+        Wire.read();
+
+
+    // =================================================
+    // Gyro Offset
+    // =================================================
+
+    gyro_pitch_data_raw -=
+        gyro_pitch_calibration_value;
+
+
+    // =================================================
+    // Gyro Integration
+    //
+    // dt = 0.004 sec
+    //
+    // ±250dps
+    //
+    // sensitivity ≈ 131 LSB/(deg/s)
+    //
+    // 0.004 / 131
+    // ≈ 0.000031
+    // =================================================
+
+    angle_gyro +=
+        gyro_pitch_data_raw *
+        0.000031;
+
+
+    // =================================================
+    // MPU6050 yaw compensation
+    // =================================================
+
+    gyro_yaw_data_raw -=
+        gyro_yaw_calibration_value;
+
+
+    angle_gyro -=
+        gyro_yaw_data_raw *
+        0.0000003;
+
+
+    // =================================================
+    // Complementary Filter
+    // =================================================
+
+    angle_gyro =
+        angle_gyro * 0.9995
+        +
+        angle_acc * 0.0005;
+
+
+    // =================================================
+    //
+    // PID CONTROLLER
+    //
+    // ★ 여기서부터 pid_output = RPM
+    //
+    // =================================================
+
+    pid_error_temp =
+        angle_gyro
+        -
+        self_balance_pid_setpoint
+        -
+        pid_setpoint;
+
+
+    /*
+     * 기존 YABR:
+     *
+     * if(pid_output > 10 || pid_output < -10)
+     *     pid_error_temp += pid_output * 0.015;
+     *
+     * 기존 출력 scale에 대한 보정이므로
+     * RPM 직접 출력에서는 제거
+     */
+
+
+    // =================================================
+    // Integral
+    // =================================================
+
+    pid_i_mem +=
+        pid_i_gain *
+        pid_error_temp;
+
+
+    // 최대 ±400 RPM에 맞게 Integral 제한
+
+    if(pid_i_mem > MAX_RPM)
+    {
+        pid_i_mem =
+            MAX_RPM;
+    }
+
+    else if(pid_i_mem < -MAX_RPM)
+    {
+        pid_i_mem =
+            -MAX_RPM;
+    }
+
+
+    // =================================================
+    // PID Output
+    //
+    // 출력 단위 = RPM
+    // =================================================
+
+    pid_output =
+          pid_p_gain
+          * pid_error_temp
+
+        +
+
+          pid_i_mem
+
+        +
+
+          pid_d_gain
+          *
+          (
+              pid_error_temp
+              -
+              pid_last_d_error
+          );
+
+
+    // =================================================
+    // RPM 제한
+    // =================================================
+
+    if(pid_output > MAX_RPM)
+    {
+        pid_output =
+            MAX_RPM;
+    }
+
+    else if(pid_output < -MAX_RPM)
+    {
+        pid_output =
+            -MAX_RPM;
+    }
+
+
+    pid_last_d_error =
+        pid_error_temp;
+
+
+    // =================================================
+    // RPM Deadband
+    // =================================================
+
+    if(
+        pid_output < RPM_DEADBAND &&
+        pid_output > -RPM_DEADBAND
+    )
+    {
+        pid_output = 0;
+    }
+
+
+    // =================================================
+    // Robot tipped over
+    // =================================================
+
+    if(
+        angle_gyro > 30 ||
+        angle_gyro < -30 ||
+        start == 0
+    )
+    {
+        pid_output = 0;
+
+        pid_i_mem = 0;
+
+        start = 0;
+
+        self_balance_pid_setpoint =
+            0;
+    }
+
+
+    // =================================================
+    // Control calculations
+    //
+    // 이제 여기도 RPM
+    // =================================================
+
+    pid_output_left =
+        pid_output;
+
+
+    pid_output_right =
+        pid_output;
+
+
+    // =================================================
+    // Turning
+    //
+    // turning_speed = RPM 차이
+    // =================================================
+
+    if(
+        received_byte &
+        B00000001
+    )
+    {
+        pid_output_left +=
+            turning_speed;
+
+
+        pid_output_right -=
+            turning_speed;
+    }
+
+
+    if(
+        received_byte &
+        B00000010
+    )
+    {
+        pid_output_left -=
+            turning_speed;
+
+
+        pid_output_right +=
+            turning_speed;
+    }
+
+
+    // =================================================
+    // Forward
+    // =================================================
+
+    if(
+        received_byte &
+        B00000100
+    )
+    {
+        if(pid_setpoint > -2.5)
+        {
+            pid_setpoint -=
+                0.05;
+        }
+
+
+        if(
+            pid_output >
+            max_target_speed * -1
+        )
+        {
+            pid_setpoint -=
+                0.005;
+        }
+    }
+
+
+    // =================================================
+    // Backward
+    // =================================================
+
+    if(
+        received_byte &
+        B00001000
+    )
+    {
+        if(pid_setpoint < 2.5)
+        {
+            pid_setpoint +=
+                0.05;
+        }
+
+
+        if(
+            pid_output <
+            max_target_speed
+        )
+        {
+            pid_setpoint +=
+                0.005;
+        }
+    }
+
+
+    // =================================================
+    // Return target angle to zero
+    // =================================================
+
+    if(
+        !(received_byte &
+          B00001100)
+    )
+    {
+        if(pid_setpoint > 0.5)
+        {
+            pid_setpoint -=
+                0.05;
+        }
+
+        else if(
+            pid_setpoint < -0.5
+        )
+        {
+            pid_setpoint +=
+                0.05;
+        }
+
+        else
+        {
+            pid_setpoint = 0;
+        }
+    }
+
+
+    // =================================================
+    // Self balance correction
+    // =================================================
+
+    if(pid_setpoint == 0)
+    {
+        if(pid_output < 0)
+        {
+            self_balance_pid_setpoint +=
+                0.0015;
+        }
+
+
+        if(pid_output > 0)
+        {
+            self_balance_pid_setpoint -=
+                0.0015;
+        }
+    }
+
+
+    // =================================================
+    //
+    // RPM → MOTOR STEP PERIOD
+    //
+    // ★ 기존 405 / 5500 / 9 경험식 제거
+    //
+    // =================================================
+
+
+    // Left motor
+    left_motor =
+        rpmToMotorTimer(
+            pid_output_left
+        );
+
+
+    // Right motor
+    right_motor =
+        rpmToMotorTimer(
+            pid_output_right
+        );
+
+
+    // =================================================
+    // ISR 변수로 전달
+    // =================================================
+
+    throttle_left_motor =
+        left_motor;
+
+
+    throttle_right_motor =
+        right_motor;
+
+
+    // =================================================
+    // Loop Time = 4ms
+    // =================================================
+
+    while(
+        loop_timer >
+        micros()
+    );
+
+
+    loop_timer +=
+        4000;
+}
+
+
+// =====================================================
+//
+// TIMER2 ISR
+//
+// 20us마다 실행
+//
+// 원본 YABR ISR 그대로 유지
+//
+// =====================================================
+
+ISR(TIMER2_COMPA_vect)
+{
+    // =================================================
+    // LEFT MOTOR
+    // =================================================
+
+    throttle_counter_left_motor++;
+
+
+    if(
+        throttle_counter_left_motor >
+        throttle_left_motor_memory
+    )
+    {
+        throttle_counter_left_motor =
+            0;
+
+
+        throttle_left_motor_memory =
+            throttle_left_motor;
+
+
+        // Reverse
+        if(
+            throttle_left_motor_memory <
+            0
+        )
+        {
+            // D3 LOW
+            PORTD &=
+                0b11110111;
+
+
+            throttle_left_motor_memory *=
+                -1;
+        }
+
+        else
+        {
+            // D3 HIGH
+            PORTD |=
+                0b00001000;
+        }
+    }
+
+
+    // STEP HIGH
+    else if(
+        throttle_counter_left_motor ==
+        1
+    )
+    {
+        // D2 HIGH
+        PORTD |=
+            0b00000100;
+    }
+
+
+    // STEP LOW
+    else if(
+        throttle_counter_left_motor ==
+        2
+    )
+    {
+        // D2 LOW
+        PORTD &=
+            0b11111011;
+    }
+
+
+    // =================================================
+    // RIGHT MOTOR
+    // =================================================
+
+    throttle_counter_right_motor++;
+
+
+    if(
+        throttle_counter_right_motor >
+        throttle_right_motor_memory
+    )
+    {
+        throttle_counter_right_motor =
+            0;
+
+
+        throttle_right_motor_memory =
+            throttle_right_motor;
+
+
+        // Reverse
+        if(
+            throttle_right_motor_memory <
+            0
+        )
+        {
+            // D5 HIGH
+            PORTD |=
+                0b00100000;
+
+
+            throttle_right_motor_memory *=
+                -1;
+        }
+
+        else
+        {
+            // D5 LOW
+            PORTD &=
+                0b11011111;
+        }
+    }
+
+
+    // STEP HIGH
+    else if(
+        throttle_counter_right_motor ==
+        1
+    )
+    {
+        // D4 HIGH
+        PORTD |=
+            0b00010000;
+    }
+
+
+    // STEP LOW
+    else if(
+        throttle_counter_right_motor ==
+        2
+    )
+    {
+        // D4 LOW
+        PORTD &=
+            0b11101111;
+    }
+}
