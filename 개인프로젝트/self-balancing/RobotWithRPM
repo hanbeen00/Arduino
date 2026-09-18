@@ -1,6 +1,11 @@
 #include <Wire.h>
 #include <SoftwareSerial.h>
 
+
+// =====================================================
+// Wireless
+// =====================================================
+
 SoftwareSerial serial_SW_wireless_module(8, 9);
 
 
@@ -10,54 +15,57 @@ SoftwareSerial serial_SW_wireless_module(8, 9);
 
 int gyro_address = 0x68;
 
+// 가속도 센서 보정값
 int acc_calibration_value = -75;
 
 
 // =====================================================
 // PID Settings
 //
+// ★ 기존 YABR 값 그대로
+//
 // 이제 pid_output의 의미:
-//        목표 RPM
+//      목표 Motor RPM
+//
+// 예:
+//   pid_output =  100  -> +100 RPM
+//   pid_output = -100  -> -100 RPM
+//   pid_output =  400  -> +400 RPM
 // =====================================================
 
-float pid_p_gain = 20.0;
-float pid_i_gain = 0.0;
-float pid_d_gain = 0.0;
+float pid_p_gain = 9.0;
+float pid_i_gain = 1.0;
+float pid_d_gain = 15.0;
 
-float turning_speed = 30;
-float max_target_speed = 150;
+float turning_speed = 30.0;
+float max_target_speed = 150.0;
 
 
 // =====================================================
 // Motor Settings
 // =====================================================
 
-// 최대 바퀴 RPM
+// PID 최대 출력 = 최대 목표 RPM
 const float MAX_RPM = 400.0;
 
-// 작은 RPM 명령 제거
-const float RPM_DEADBAND = 5.0;
-
-
-// 1.8도 Stepper
-// 360 / 1.8 = 200 full step
-
+// YABR Motor
+// Full step = 1.8°
+// 360 / 1.8 = 200 step/rev
 const int FULL_STEP_PER_REV = 200;
 
-
-// 1/4 Microstep
+// Driver = 1/4 microstep
 const int MICROSTEP = 4;
 
-
-// 200 × 4 = 800 pulse / revolution
+// 200 * 4 = 800 pulse/rev
 const int STEP_PER_REV =
     FULL_STEP_PER_REV * MICROSTEP;
 
 
-// Timer2 ISR = 20us
+// Timer2 ISR
 //
-// 1 / 20us = 50,000Hz
-
+// 20 us마다 인터럽트
+//
+// 1 / 20us = 50,000 Hz
 const float TIMER_ISR_FREQ = 50000.0;
 
 
@@ -70,11 +78,11 @@ byte received_byte;
 byte low_bat;
 
 
+// Motor variables
 int left_motor;
 int throttle_left_motor;
 int throttle_counter_left_motor;
 int throttle_left_motor_memory;
-
 
 int right_motor;
 int throttle_right_motor;
@@ -82,29 +90,37 @@ int throttle_counter_right_motor;
 int throttle_right_motor_memory;
 
 
+// 기타
 int battery_voltage;
 int receive_counter;
 
 
+// MPU6050 RAW
 int gyro_pitch_data_raw;
 int gyro_yaw_data_raw;
 int accelerometer_data_raw;
 
 
+// Gyro Calibration
 long gyro_yaw_calibration_value;
 long gyro_pitch_calibration_value;
 
 
+// 4ms control loop
 unsigned long loop_timer;
 
 
+// Angle
 float angle_gyro;
 float angle_acc;
 float angle;
 
+
+// 자동 균형점
 float self_balance_pid_setpoint;
 
 
+// PID
 float pid_error_temp;
 float pid_i_mem;
 float pid_setpoint;
@@ -115,59 +131,46 @@ float pid_output;
 float pid_last_d_error;
 
 
+// Left / Right RPM
 float pid_output_left;
 float pid_output_right;
 
 
 // =====================================================
-// RPM → Motor TimerCount
+// RPM -> Motor Timer Count
 //
-// 1회전 = 800 pulse
+// RPM
+//  ↓
+// STEP frequency
+//  ↓
+// Timer2 Count
 //
-// STEP 주파수:
+// f_step = RPM / 60 * 800
 //
-// f_step = RPM / 60 × 800
+// TimerPeriod = 50000 / f_step
 //
-// Timer ISR:
+// 실제 ISR 주기는
+// (timer_count + 1) * 20us
 //
-// 50,000 Hz
-//
-// 필요한 ISR 횟수:
-//
-// TimerCount
-// = 50000 / f_step
-//
-// = 50000 / (RPM / 60 × 800)
-//
-// = 3750 / RPM
-//
-// 현재 ISR에서
-//
-// counter > memory
-//
-// 일 때 counter가 reset되므로
-//
-// 실제 주기 = memory + 1
-//
-// 따라서 마지막에 -1
+// 따라서:
+// timer_count = 50000 / f_step - 1
 // =====================================================
 
 int rpmToMotorTimer(float rpm)
 {
-    // ==============================================
-    // Deadband
-    // ==============================================
+    // -------------------------------------------------
+    // 정지
+    // -------------------------------------------------
 
-    if(rpm < RPM_DEADBAND &&
-       rpm > -RPM_DEADBAND)
+    if(rpm == 0.0)
     {
         return 0;
     }
 
 
-    // ==============================================
-    // 최대 RPM 제한
-    // ==============================================
+    // -------------------------------------------------
+    // RPM Limit
+    // -------------------------------------------------
 
     if(rpm > MAX_RPM)
     {
@@ -180,58 +183,71 @@ int rpmToMotorTimer(float rpm)
     }
 
 
-    // ==============================================
+    // -------------------------------------------------
     // 방향 저장
-    // ==============================================
+    // -------------------------------------------------
 
     bool reverse = false;
 
     if(rpm < 0)
     {
         reverse = true;
-        rpm *= -1;
+        rpm = -rpm;
     }
 
 
-    // ==============================================
-    // RPM → STEP Frequency
-    // ==============================================
+    // -------------------------------------------------
+    // RPM -> STEP Frequency
+    //
+    // 예:
+    //
+    // 100 RPM
+    //
+    // = 100 / 60 * 800
+    //
+    // = 1333.33 Hz
+    // -------------------------------------------------
 
     float step_frequency =
-        (rpm / 60.0)
-        * STEP_PER_REV;
+        (rpm / 60.0) * STEP_PER_REV;
 
 
-    // ==============================================
-    // STEP Frequency → ISR Count
-    // ==============================================
+    // -------------------------------------------------
+    // STEP Frequency -> Timer Count
+    //
+    // Timer2 ISR = 50000 Hz
+    //
+    // 100 RPM라면
+    //
+    // 50000 / 1333.33
+    //
+    // = 37.5 ISR
+    //
+    // 실제 코드가
+    // counter > memory
+    // 조건이므로 -1
+    // -------------------------------------------------
 
-    float timer_count_float =
-        TIMER_ISR_FREQ /
-        step_frequency;
+    float timer_period =
+        TIMER_ISR_FREQ / step_frequency;
 
 
     int timer_count =
-        (int)round(timer_count_float);
+        (int)(timer_period + 0.5) - 1;
 
 
-    // 현재 ISR 구조가
-    //
-    // counter > memory
-    //
-    // 이므로 실제 주기 = memory + 1
-    //
-    timer_count -= 1;
-
-
-    // STEP HIGH / LOW를 위한 최소 공간
+    // STEP pulse는 HIGH / LOW가 필요하므로
+    // 너무 작은 timer count 방지
     if(timer_count < 2)
     {
         timer_count = 2;
     }
 
 
-    // 방향은 부호로 전달
+    // -------------------------------------------------
+    // 방향
+    // -------------------------------------------------
+
     if(reverse)
     {
         timer_count *= -1;
@@ -253,87 +269,89 @@ void setup()
     Serial.begin(19200);
 
 
+    // -------------------------------------------------
+    // I2C
+    // -------------------------------------------------
+
     Wire.begin();
 
+    // 400kHz I2C
     TWBR = 12;
 
 
-    // =================================================
+    // -------------------------------------------------
     // Timer2
     //
-    // ISR every 20us
-    // =================================================
+    // 20us마다 ISR 발생
+    // -------------------------------------------------
 
     TCCR2A = 0;
     TCCR2B = 0;
 
-
     TIMSK2 |= (1 << OCIE2A);
-
 
     // Prescaler = 8
     TCCR2B |= (1 << CS21);
-
 
     // 16MHz / 8
     //
     // OCR2A = 39
     //
-    // → 20us
+    // = 20us
     OCR2A = 39;
-
 
     // CTC mode
     TCCR2A |= (1 << WGM21);
 
 
     // =================================================
-    // MPU6050 Wake-up
+    // MPU6050 Setup
     // =================================================
+
+
+    // -------------------------------------------------
+    // Wake Up
+    // -------------------------------------------------
 
     Wire.beginTransmission(gyro_address);
 
     Wire.write(0x6B);
-
     Wire.write(0x00);
 
     Wire.endTransmission();
 
 
-    // =================================================
-    // Gyro ±250 degrees/sec
-    // =================================================
+    // -------------------------------------------------
+    // Gyro ±250 deg/s
+    // -------------------------------------------------
 
     Wire.beginTransmission(gyro_address);
 
     Wire.write(0x1B);
-
     Wire.write(0x00);
 
     Wire.endTransmission();
 
 
-    // =================================================
+    // -------------------------------------------------
     // Accelerometer ±4g
-    // =================================================
+    // -------------------------------------------------
 
     Wire.beginTransmission(gyro_address);
 
     Wire.write(0x1C);
-
     Wire.write(0x08);
 
     Wire.endTransmission();
 
 
-    // =================================================
-    // Digital Low Pass Filter ≈ 43Hz
-    // =================================================
+    // -------------------------------------------------
+    // DLPF ≈ 43 Hz
+    // -------------------------------------------------
 
     Wire.beginTransmission(gyro_address);
 
     Wire.write(0x1A);
-
     Wire.write(0x03);
 
     Wire.endTransmission();
@@ -354,13 +372,13 @@ void setup()
 
     // =================================================
     // Gyro Calibration
+    //
+    // ★ 기존 YABR 그대로
     // =================================================
 
-    for(
-        receive_counter = 0;
+    for(receive_counter = 0;
         receive_counter < 500;
-        receive_counter++
-    )
+        receive_counter++)
     {
         if(receive_counter % 15 == 0)
         {
@@ -371,10 +389,7 @@ void setup()
         }
 
 
-        Wire.beginTransmission(
-            gyro_address
-        );
-
+        Wire.beginTransmission(gyro_address);
 
         Wire.write(0x43);
 
@@ -401,17 +416,16 @@ void setup()
     }
 
 
-    gyro_pitch_calibration_value /=
-        500;
+    gyro_pitch_calibration_value /= 500;
+
+    gyro_yaw_calibration_value /= 500;
 
 
-    gyro_yaw_calibration_value /=
-        500;
+    // =================================================
+    // Control Loop = 4ms
+    // =================================================
 
-
-    // 4ms control loop
-    loop_timer =
-        micros() + 4000;
+    loop_timer = micros() + 4000;
 }
 
 
@@ -421,16 +435,12 @@ void setup()
 
 void loop()
 {
-    char s;
-
 
     // =================================================
     // Wireless Controller
     // =================================================
 
-    if(
-        serial_SW_wireless_module.available()
-    )
+    if(serial_SW_wireless_module.available())
     {
         received_byte =
             serial_SW_wireless_module.read();
@@ -439,6 +449,7 @@ void loop()
     }
 
 
+    // 받은 명령은 약 100ms 동안 유지
     if(receive_counter <= 25)
     {
         receive_counter++;
@@ -451,13 +462,12 @@ void loop()
 
 
     // =================================================
-    // Accelerometer
+    // Accelerometer Angle
+    //
+    // ★ 기존 YABR 그대로
     // =================================================
 
-    Wire.beginTransmission(
-        gyro_address
-    );
-
+    Wire.beginTransmission(gyro_address);
 
     Wire.write(0x3F);
 
@@ -475,49 +485,45 @@ void loop()
         Wire.read();
 
 
+    // 가속도 센서 offset
     accelerometer_data_raw +=
         acc_calibration_value;
 
 
+    // ±4g 설정에서 YABR 기준값
     if(accelerometer_data_raw > 8200)
     {
-        accelerometer_data_raw =
-            8200;
+        accelerometer_data_raw = 8200;
     }
-
 
     if(accelerometer_data_raw < -8200)
     {
-        accelerometer_data_raw =
-            -8200;
+        accelerometer_data_raw = -8200;
     }
 
 
-    // =================================================
-    // Accelerometer Angle
-    // =================================================
-
+    // 가속도 기반 각도
     angle_acc =
         asin(
-            (float)
-            accelerometer_data_raw /
-            8200.0
+            (float)accelerometer_data_raw
+            / 8200.0
         )
         * 57.296;
 
 
     // =================================================
-    // Start PID near 0 degrees
+    // Start
     // =================================================
 
     if(
-        start == 0 &&
-        angle_acc > -0.25 &&
+        start == 0
+        &&
+        angle_acc > -0.25
+        &&
         angle_acc < 0.25
-    )
+      )
     {
-        angle_gyro =
-            angle_acc;
+        angle_gyro = angle_acc;
 
         start = 1;
     }
@@ -527,10 +533,7 @@ void loop()
     // Gyroscope
     // =================================================
 
-    Wire.beginTransmission(
-        gyro_address
-    );
-
+    Wire.beginTransmission(gyro_address);
 
     Wire.write(0x43);
 
@@ -553,34 +556,30 @@ void loop()
         Wire.read();
 
 
-    // =================================================
-    // Gyro Offset
-    // =================================================
+    // -------------------------------------------------
+    // Pitch Offset 제거
+    // -------------------------------------------------
 
     gyro_pitch_data_raw -=
         gyro_pitch_calibration_value;
 
 
-    // =================================================
-    // Gyro Integration
+    // -------------------------------------------------
+    // Gyro integration
     //
-    // dt = 0.004 sec
-    //
-    // ±250dps
-    //
-    // sensitivity ≈ 131 LSB/(deg/s)
-    //
-    // 0.004 / 131
-    // ≈ 0.000031
-    // =================================================
+    // 기존 YABR 그대로
+    // -------------------------------------------------
 
     angle_gyro +=
-        gyro_pitch_data_raw *
-        0.000031;
+        gyro_pitch_data_raw
+        * 0.000031;
 
 
     // =================================================
-    // MPU6050 yaw compensation
+    // Yaw Compensation
+    //
+    // 로봇 회전시 pitch angle 오차 보정
+    // ★ 기존 YABR 그대로
     // =================================================
 
     gyro_yaw_data_raw -=
@@ -588,12 +587,14 @@ void loop()
 
 
     angle_gyro -=
-        gyro_yaw_data_raw *
-        0.0000003;
+        gyro_yaw_data_raw
+        * 0.0000003;
 
 
     // =================================================
     // Complementary Filter
+    //
+    // ★ 기존 YABR 그대로
     // =================================================
 
     angle_gyro =
@@ -603,12 +604,17 @@ void loop()
 
 
     // =================================================
+    // PID Controller
     //
-    // PID CONTROLLER
+    // 출력값 = 목표 RPM
     //
-    // ★ 여기서부터 pid_output = RPM
-    //
+    // ★ 계산 방식은 기존 YABR 그대로
     // =================================================
+
+
+    // -------------------------------------------------
+    // Angle Error
+    // -------------------------------------------------
 
     pid_error_temp =
         angle_gyro
@@ -618,58 +624,57 @@ void loop()
         pid_setpoint;
 
 
-    /*
-     * 기존 YABR:
-     *
-     * if(pid_output > 10 || pid_output < -10)
-     *     pid_error_temp += pid_output * 0.015;
-     *
-     * 기존 출력 scale에 대한 보정이므로
-     * RPM 직접 출력에서는 제거
-     */
+    // -------------------------------------------------
+    // YABR의 기존 출력 되먹임 보정
+    //
+    // ★ 그대로 유지
+    // -------------------------------------------------
+
+    if(
+        pid_output > 10
+        ||
+        pid_output < -10
+      )
+    {
+        pid_error_temp +=
+            pid_output * 0.015;
+    }
 
 
-    // =================================================
-    // Integral
-    // =================================================
+    // -------------------------------------------------
+    // I Controller
+    // -------------------------------------------------
 
     pid_i_mem +=
-        pid_i_gain *
+        pid_i_gain
+        *
         pid_error_temp;
 
 
-    // 최대 ±400 RPM에 맞게 Integral 제한
-
     if(pid_i_mem > MAX_RPM)
     {
-        pid_i_mem =
-            MAX_RPM;
+        pid_i_mem = MAX_RPM;
     }
 
     else if(pid_i_mem < -MAX_RPM)
     {
-        pid_i_mem =
-            -MAX_RPM;
+        pid_i_mem = -MAX_RPM;
     }
 
 
-    // =================================================
-    // PID Output
+    // -------------------------------------------------
+    // PID
     //
-    // 출력 단위 = RPM
-    // =================================================
+    // 이제 최종 단위를 RPM으로 해석
+    // -------------------------------------------------
 
     pid_output =
           pid_p_gain
           * pid_error_temp
 
-        +
+        + pid_i_mem
 
-          pid_i_mem
-
-        +
-
-          pid_d_gain
+        + pid_d_gain
           *
           (
               pid_error_temp
@@ -678,49 +683,55 @@ void loop()
           );
 
 
-    // =================================================
-    // RPM 제한
-    // =================================================
+    // -------------------------------------------------
+    // ±400 RPM Limit
+    // -------------------------------------------------
 
     if(pid_output > MAX_RPM)
     {
-        pid_output =
-            MAX_RPM;
+        pid_output = MAX_RPM;
     }
 
     else if(pid_output < -MAX_RPM)
     {
-        pid_output =
-            -MAX_RPM;
+        pid_output = -MAX_RPM;
     }
 
 
+    // D 항용 이전 error 저장
     pid_last_d_error =
         pid_error_temp;
 
 
-    // =================================================
-    // RPM Deadband
-    // =================================================
+    // -------------------------------------------------
+    // 기존 YABR Deadband
+    //
+    // ±5 RPM 이하 정지
+    // -------------------------------------------------
 
     if(
-        pid_output < RPM_DEADBAND &&
-        pid_output > -RPM_DEADBAND
-    )
+        pid_output < 5
+        &&
+        pid_output > -5
+      )
     {
         pid_output = 0;
     }
 
 
     // =================================================
-    // Robot tipped over
+    // Fall Detection
+    //
+    // ★ 기존 YABR 그대로
     // =================================================
 
     if(
-        angle_gyro > 30 ||
-        angle_gyro < -30 ||
+        angle_gyro > 30
+        ||
+        angle_gyro < -30
+        ||
         start == 0
-    )
+      )
     {
         pid_output = 0;
 
@@ -728,20 +739,16 @@ void loop()
 
         start = 0;
 
-        self_balance_pid_setpoint =
-            0;
+        self_balance_pid_setpoint = 0;
     }
 
 
     // =================================================
-    // Control calculations
-    //
-    // 이제 여기도 RPM
+    // Left / Right Motor RPM
     // =================================================
 
     pid_output_left =
         pid_output;
-
 
     pid_output_right =
         pid_output;
@@ -750,31 +757,27 @@ void loop()
     // =================================================
     // Turning
     //
-    // turning_speed = RPM 차이
+    // 이제 turning_speed = RPM
+    //
+    // 예:
+    // Left +30RPM
+    // Right -30RPM
     // =================================================
 
-    if(
-        received_byte &
-        B00000001
-    )
+    if(received_byte & B00000001)
     {
         pid_output_left +=
             turning_speed;
-
 
         pid_output_right -=
             turning_speed;
     }
 
 
-    if(
-        received_byte &
-        B00000010
-    )
+    if(received_byte & B00000010)
     {
         pid_output_left -=
             turning_speed;
-
 
         pid_output_right +=
             turning_speed;
@@ -783,27 +786,25 @@ void loop()
 
     // =================================================
     // Forward
+    //
+    // ★ 기존 YABR 그대로
     // =================================================
 
-    if(
-        received_byte &
-        B00000100
-    )
+    if(received_byte & B00000100)
     {
         if(pid_setpoint > -2.5)
         {
-            pid_setpoint -=
-                0.05;
+            pid_setpoint -= 0.05;
         }
 
 
         if(
-            pid_output >
+            pid_output
+            >
             max_target_speed * -1
-        )
+          )
         {
-            pid_setpoint -=
-                0.005;
+            pid_setpoint -= 0.005;
         }
     }
 
@@ -812,50 +813,44 @@ void loop()
     // Backward
     // =================================================
 
-    if(
-        received_byte &
-        B00001000
-    )
+    if(received_byte & B00001000)
     {
         if(pid_setpoint < 2.5)
         {
-            pid_setpoint +=
-                0.05;
+            pid_setpoint += 0.05;
         }
 
 
         if(
-            pid_output <
+            pid_output
+            <
             max_target_speed
-        )
+          )
         {
-            pid_setpoint +=
-                0.005;
+            pid_setpoint += 0.005;
         }
     }
 
 
     // =================================================
-    // Return target angle to zero
+    // Setpoint Return
+    //
+    // 전진/후진 명령이 없으면
+    // pid_setpoint -> 0
+    //
+    // ★ 기존 YABR 그대로
     // =================================================
 
-    if(
-        !(received_byte &
-          B00001100)
-    )
+    if(!(received_byte & B00001100))
     {
         if(pid_setpoint > 0.5)
         {
-            pid_setpoint -=
-                0.05;
+            pid_setpoint -= 0.05;
         }
 
-        else if(
-            pid_setpoint < -0.5
-        )
+        else if(pid_setpoint < -0.5)
         {
-            pid_setpoint +=
-                0.05;
+            pid_setpoint += 0.05;
         }
 
         else
@@ -866,88 +861,93 @@ void loop()
 
 
     // =================================================
-    // Self balance correction
+    // Self Balance Setpoint
+    //
+    // ★ 기존 YABR 그대로
+    //
+    // 정지 상태에서 모터가 계속 한 방향으로
+    // 움직이는 현상을 보정
     // =================================================
 
     if(pid_setpoint == 0)
     {
         if(pid_output < 0)
         {
-            self_balance_pid_setpoint +=
-                0.0015;
+            self_balance_pid_setpoint
+                += 0.0015;
         }
 
 
         if(pid_output > 0)
         {
-            self_balance_pid_setpoint -=
-                0.0015;
+            self_balance_pid_setpoint
+                -= 0.0015;
         }
     }
 
 
     // =================================================
+    // ★ 변경된 부분
     //
-    // RPM → MOTOR STEP PERIOD
+    // 기존 YABR:
     //
-    // ★ 기존 405 / 5500 / 9 경험식 제거
+    // 405 - 5500 / (PID + 9)
     //
+    // 삭제
+    //
+    //
+    // 현재:
+    //
+    // PID output
+    //      ↓
+    // Target RPM
+    //      ↓
+    // STEP frequency
+    //      ↓
+    // Timer Count
     // =================================================
 
-
-    // Left motor
     left_motor =
         rpmToMotorTimer(
             pid_output_left
         );
 
 
-    // Right motor
     right_motor =
         rpmToMotorTimer(
             pid_output_right
         );
 
 
-    // =================================================
-    // ISR 변수로 전달
-    // =================================================
-
+    // ISR에 전달
     throttle_left_motor =
         left_motor;
-
 
     throttle_right_motor =
         right_motor;
 
 
     // =================================================
-    // Loop Time = 4ms
+    // Loop Time = 4ms = 250Hz
     // =================================================
 
-    while(
-        loop_timer >
-        micros()
-    );
+    while(loop_timer > micros());
 
-
-    loop_timer +=
-        4000;
+    loop_timer += 4000;
 }
 
 
 // =====================================================
-//
 // TIMER2 ISR
 //
-// 20us마다 실행
+// 20 us마다 실행
 //
-// 원본 YABR ISR 그대로 유지
-//
+// ★ 기존 YABR 그대로
 // =====================================================
 
 ISR(TIMER2_COMPA_vect)
 {
+
     // =================================================
     // LEFT MOTOR
     // =================================================
@@ -956,31 +956,35 @@ ISR(TIMER2_COMPA_vect)
 
 
     if(
-        throttle_counter_left_motor >
+        throttle_counter_left_motor
+        >
         throttle_left_motor_memory
-    )
+      )
     {
-        throttle_counter_left_motor =
-            0;
+        throttle_counter_left_motor = 0;
 
 
         throttle_left_motor_memory =
             throttle_left_motor;
 
 
+        // ---------------------------------------------
         // Reverse
+        // ---------------------------------------------
+
         if(
-            throttle_left_motor_memory <
+            throttle_left_motor_memory
+            <
             0
-        )
+          )
         {
             // D3 LOW
             PORTD &=
                 0b11110111;
 
 
-            throttle_left_motor_memory *=
-                -1;
+            throttle_left_motor_memory
+                *= -1;
         }
 
         else
@@ -994,9 +998,10 @@ ISR(TIMER2_COMPA_vect)
 
     // STEP HIGH
     else if(
-        throttle_counter_left_motor ==
+        throttle_counter_left_motor
+        ==
         1
-    )
+      )
     {
         // D2 HIGH
         PORTD |=
@@ -1006,9 +1011,10 @@ ISR(TIMER2_COMPA_vect)
 
     // STEP LOW
     else if(
-        throttle_counter_left_motor ==
+        throttle_counter_left_motor
+        ==
         2
-    )
+      )
     {
         // D2 LOW
         PORTD &=
@@ -1024,31 +1030,35 @@ ISR(TIMER2_COMPA_vect)
 
 
     if(
-        throttle_counter_right_motor >
+        throttle_counter_right_motor
+        >
         throttle_right_motor_memory
-    )
+      )
     {
-        throttle_counter_right_motor =
-            0;
+        throttle_counter_right_motor = 0;
 
 
         throttle_right_motor_memory =
             throttle_right_motor;
 
 
+        // ---------------------------------------------
         // Reverse
+        // ---------------------------------------------
+
         if(
-            throttle_right_motor_memory <
+            throttle_right_motor_memory
+            <
             0
-        )
+          )
         {
             // D5 HIGH
             PORTD |=
                 0b00100000;
 
 
-            throttle_right_motor_memory *=
-                -1;
+            throttle_right_motor_memory
+                *= -1;
         }
 
         else
@@ -1062,9 +1072,10 @@ ISR(TIMER2_COMPA_vect)
 
     // STEP HIGH
     else if(
-        throttle_counter_right_motor ==
+        throttle_counter_right_motor
+        ==
         1
-    )
+      )
     {
         // D4 HIGH
         PORTD |=
@@ -1074,9 +1085,10 @@ ISR(TIMER2_COMPA_vect)
 
     // STEP LOW
     else if(
-        throttle_counter_right_motor ==
+        throttle_counter_right_motor
+        ==
         2
-    )
+      )
     {
         // D4 LOW
         PORTD &=
